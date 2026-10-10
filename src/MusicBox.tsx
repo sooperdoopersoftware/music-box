@@ -1,6 +1,12 @@
 "use client";
 
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import {
   Barrel,
   PRESET_BARRELS,
@@ -13,7 +19,7 @@ import {
   loadSavedBarrels,
   persistBarrel,
 } from "./music-box";
-import { pluck, primeAudio, setDelayAmount, setReverbAmount } from "./music-synth";
+import { pluck, primeAudio, setDelayAmount, setDelayTime, setReverbAmount, syncAudioClock } from "./music-synth";
 
 // A horizontal cylinder viewed from the side: its length runs left-to-right
 // (one track per prong, matching the comb laid out the same way above it),
@@ -27,6 +33,21 @@ const TRACK_MARGIN = 46;
 const WOBBLE_PX = 14; // horizontal "roundness" wobble as a track's pin orbits
 const READ_ANGLE = 0; // 0 = top of the orbit, where pins trigger their prong
 const FLASH_DURATION = 0.25; // seconds
+const COMB_LONGEST_TOOTH = 34; // lowest pitch
+const COMB_SHORTEST_TOOTH = 20; // highest pitch
+
+// Steps are detected on animation frames, which land a few milliseconds
+// early or late. Each pluck is scheduled this far ahead on the audio clock,
+// less however long ago its step actually passed, so the rhythm comes out
+// even regardless of frame timing.
+const SCHEDULE_AHEAD = 0.05; // seconds
+const DELAY_STEPS = 1.5; // echo spacing, in steps — a dotted step, so echoes fall between the notes
+
+// Editor grid geometry, shared by the cells and the playhead over them.
+const EDITOR_CELL_PX = 16;
+const EDITOR_GAP_PX = 4;
+const EDITOR_LABEL_PX = 40;
+const EDITOR_PITCH_PX = EDITOR_CELL_PX + EDITOR_GAP_PX;
 
 // Tempo knob. A step is an eighth of a beat pair — quarter notes in the
 // presets are 2 steps apart — so a revolution's beat count is STEPS/2.
@@ -91,6 +112,18 @@ function Knob({
     }
   };
 
+  const handleKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    const step = e.shiftKey ? 10 : 1;
+    let next: number;
+    if (e.key === "ArrowUp" || e.key === "ArrowRight") next = value + step;
+    else if (e.key === "ArrowDown" || e.key === "ArrowLeft") next = value - step;
+    else if (e.key === "Home") next = min;
+    else if (e.key === "End") next = max;
+    else return;
+    e.preventDefault();
+    onChange(Math.min(max, Math.max(min, next)));
+  };
+
   const t = (value - min) / (max - min);
   const angle = -KNOB_SWEEP_DEG / 2 + t * KNOB_SWEEP_DEG;
 
@@ -101,6 +134,8 @@ function Knob({
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerUp}
+        onKeyDown={handleKeyDown}
+        tabIndex={0}
         className="relative h-9 w-9 shrink-0 select-none rounded-full border border-foreground/20 bg-foreground/5"
         style={{ touchAction: "none", cursor: "ns-resize" }}
         role="slider"
@@ -108,6 +143,7 @@ function Knob({
         aria-valuemin={min}
         aria-valuemax={max}
         aria-valuenow={value}
+        aria-valuetext={format(value)}
       >
         <div
           className="absolute inset-0 flex justify-center"
@@ -123,6 +159,7 @@ function Knob({
 
 export default function MusicBox() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const playheadRef = useRef<HTMLDivElement>(null);
   const [barrels, setBarrels] = useState<Barrel[]>(() => [...PRESET_BARRELS, ...loadSavedBarrels()]);
   const [selectedId, setSelectedId] = useState(PRESET_BARRELS[0].id);
   const [workingBarrel, setWorkingBarrel] = useState<Barrel>(() =>
@@ -151,6 +188,8 @@ export default function MusicBox() {
   }, [playing]);
   useEffect(() => {
     revolutionSecondsRef.current = (BEATS_PER_REVOLUTION * 60) / bpm;
+    // Keep the echoes locked to the tempo instead of a fixed time.
+    setDelayTime((DELAY_STEPS * revolutionSecondsRef.current) / STEPS);
   }, [bpm]);
   useEffect(() => {
     setDelayAmount(delayMix / 100);
@@ -170,15 +209,26 @@ export default function MusicBox() {
     canvas.height = CANVAS_HEIGHT * dpr;
     ctx.scale(dpr, dpr);
 
-    const rootStyle = getComputedStyle(document.documentElement);
-    const wallColor = cssColorToRgb(rootStyle.getPropertyValue("--foreground").trim() || "#171717");
-    const accentColor = cssColorToRgb(rootStyle.getPropertyValue("--accent").trim() || "#d97706");
-    const wallCss = `rgba(${wallColor[0]}, ${wallColor[1]}, ${wallColor[2]}, `;
-    const accentCss = `rgba(${accentColor[0]}, ${accentColor[1]}, ${accentColor[2]}, `;
+    let wallCss: string;
+    let accentCss: string;
+    const readColors = () => {
+      const rootStyle = getComputedStyle(document.documentElement);
+      const wallColor = cssColorToRgb(rootStyle.getPropertyValue("--foreground").trim() || "#171717");
+      const accentColor = cssColorToRgb(rootStyle.getPropertyValue("--accent").trim() || "#d97706");
+      wallCss = `rgba(${wallColor[0]}, ${wallColor[1]}, ${wallColor[2]}, `;
+      accentCss = `rgba(${accentColor[0]}, ${accentColor[1]}, ${accentColor[2]}, `;
+    };
+    readColors();
+    // The theme variables follow the OS colour scheme; pick up a switch
+    // without needing a reload.
+    const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
+    colorScheme.addEventListener("change", readColors);
 
     let rafId: number;
     let lastTime = performance.now();
-    let stepAcc = 0;
+    // Start a hair before step 0 so the first frame of playback crosses it
+    // and the opening note sounds, instead of waiting a whole revolution.
+    let stepAcc = -1e-6;
 
     const cy = BARREL_CENTER_Y;
     const leftCap = trackX(0);
@@ -192,7 +242,6 @@ export default function MusicBox() {
       // Comb legend across the top: one tooth per prong, low pitch to high,
       // positioned directly above its track, glowing when just plucked.
       const combY = 16;
-      const combHeight = 28;
       ctx.strokeStyle = wallCss + "0.5)";
       ctx.lineWidth = 1.5;
       ctx.beginPath();
@@ -202,6 +251,9 @@ export default function MusicBox() {
 
       for (let p = 0; p < PRONGS.length; p++) {
         const tx = trackX(p);
+        // Longer teeth for lower notes, like a real comb.
+        const combHeight =
+          COMB_LONGEST_TOOTH - (p / (PRONGS.length - 1)) * (COMB_LONGEST_TOOTH - COMB_SHORTEST_TOOTH);
         const glow = Math.max(0, 1 - (nowSeconds - flashRef.current[p]) / FLASH_DURATION);
         ctx.strokeStyle = glow > 0 ? accentCss + "1)" : wallCss + "0.5)";
         ctx.lineWidth = glow > 0 ? 3 : 1.5;
@@ -276,6 +328,7 @@ export default function MusicBox() {
       const dt = Math.min(0.1, (now - lastTime) / 1000);
       lastTime = now;
       const nowSeconds = now / 1000;
+      syncAudioClock();
 
       if (isPlayingRef.current) {
         const stepsPerSecond = STEPS / revolutionSecondsRef.current;
@@ -286,9 +339,10 @@ export default function MusicBox() {
         const barrel = workingBarrelRef.current;
         for (let s = prevFloor + 1; s <= currFloor; s++) {
           const stepIndex = ((s % STEPS) + STEPS) % STEPS;
+          const sinceStep = (stepAcc - s) / stepsPerSecond;
           for (let p = 0; p < PRONGS.length; p++) {
             if (barrel.pins[p][stepIndex]) {
-              pluck(PRONGS[p].freq);
+              pluck(PRONGS[p].freq, 1, SCHEDULE_AHEAD - sinceStep);
               flashRef.current[p] = nowSeconds;
               pinFlashRef.current[p][stepIndex] = nowSeconds;
             }
@@ -297,11 +351,22 @@ export default function MusicBox() {
       }
 
       draw(nowSeconds);
+      // The editor's playhead is moved directly rather than through React
+      // state, which would re-render the whole grid on every step.
+      const playhead = playheadRef.current;
+      if (playhead) {
+        const column = ((Math.floor(stepAcc) % STEPS) + STEPS) % STEPS;
+        playhead.style.transform = `translateX(${column * EDITOR_PITCH_PX}px)`;
+        playhead.style.opacity = stepAcc >= 0 ? "1" : "0";
+      }
       rafId = requestAnimationFrame(tick);
     };
 
     rafId = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(rafId);
+    return () => {
+      cancelAnimationFrame(rafId);
+      colorScheme.removeEventListener("change", readColors);
+    };
   }, []);
 
   const selectBarrel = (id: string) => {
@@ -320,6 +385,9 @@ export default function MusicBox() {
       r === prongIndex ? row.map((value, s) => (s === step ? !value : value)) : row,
     );
     const target: Barrel = { ...base, pins };
+    // Sound a pin as it's placed, so writing a tune doesn't mean waiting
+    // for the barrel to come round to hear each note.
+    if (pins[prongIndex][step]) pluck(PRONGS[prongIndex].freq);
 
     if (workingBarrel.isPreset) {
       setBarrels((bs) => [...bs, target]);
@@ -359,7 +427,7 @@ export default function MusicBox() {
     <div className="flex flex-col items-center gap-5">
       <canvas
         ref={canvasRef}
-        style={{ width: CANVAS_WIDTH, height: CANVAS_HEIGHT, maxWidth: "100%" }}
+        style={{ width: "100%", maxWidth: CANVAS_WIDTH, aspectRatio: `${CANVAS_WIDTH} / ${CANVAS_HEIGHT}` }}
       />
 
       <div className="flex flex-wrap items-center justify-center gap-3 text-sm">
@@ -438,7 +506,15 @@ export default function MusicBox() {
           </div>
 
           <div className="overflow-x-auto rounded-lg border border-foreground/10 p-3">
-            <div className="flex flex-col gap-0.5" style={{ minWidth: STEPS * 16 + 48 }}>
+            <div
+              className="relative flex flex-col gap-0.5"
+              style={{ minWidth: EDITOR_LABEL_PX + STEPS * EDITOR_PITCH_PX }}
+            >
+              <div
+                ref={playheadRef}
+                className="pointer-events-none absolute inset-y-0 rounded-sm bg-accent/20"
+                style={{ left: EDITOR_LABEL_PX + EDITOR_GAP_PX, width: EDITOR_CELL_PX, opacity: 0 }}
+              />
               {[...PRONGS].map((prong, displayIndex) => {
                 const prongIndex = PRONGS.length - 1 - displayIndex;
                 return (
@@ -456,7 +532,7 @@ export default function MusicBox() {
                           className={`h-4 w-4 shrink-0 rounded-sm border ${
                             active
                               ? "border-accent bg-accent"
-                              : "border-foreground/10 bg-foreground/5 hover:bg-foreground/10"
+                              : `${step % 4 === 0 ? "border-foreground/30" : "border-foreground/10"} bg-foreground/5 hover:bg-foreground/10`
                           }`}
                           aria-label={`${PRONGS[prongIndex].label} at step ${step + 1}`}
                         />

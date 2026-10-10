@@ -1,6 +1,6 @@
 {
   "name": "@sooperdoopersoftware/music-box",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
   "description": "A rolling barrel of pins plucks a comb as it spins — an editable, swappable music-box visualizer with a built-in Web Audio synth (delay/reverb included). Ships as TypeScript source; consuming Next.js apps should add this package to transpilePackages.",
   "license": "MIT",

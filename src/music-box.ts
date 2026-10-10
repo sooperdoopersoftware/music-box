@@ -118,6 +118,18 @@ export const PRESET_BARRELS: Barrel[] = [TWINKLE, ARPEGGIO, ARPEGGIO_BOUNCE];
 
 const STORAGE_KEY = "sooper-dooper:music-box:barrels";
 
+function isStoredBarrel(value: unknown): value is Barrel {
+  if (typeof value !== "object" || value === null) return false;
+  const { id, name, pins } = value as Partial<Barrel>;
+  return (
+    typeof id === "string" &&
+    typeof name === "string" &&
+    Array.isArray(pins) &&
+    pins.length === PRONGS.length &&
+    pins.every((row) => Array.isArray(row) && row.length === STEPS)
+  );
+}
+
 export function loadSavedBarrels(): Barrel[] {
   if (typeof window === "undefined") return [];
   try {
@@ -125,21 +137,29 @@ export function loadSavedBarrels(): Barrel[] {
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed as Barrel[];
+    // Drop anything that doesn't fit the current comb and step count (an
+    // edited or older entry) rather than let it break rendering.
+    return parsed.filter(isStoredBarrel);
   } catch {
     return [];
   }
 }
 
+function writeSavedBarrels(barrels: Barrel[]) {
+  // Storage can be full or blocked outright (private windows); a barrel
+  // that can't be saved still plays for the rest of the session.
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(barrels));
+  } catch {}
+}
+
 export function persistBarrel(barrel: Barrel) {
   if (typeof window === "undefined") return;
   const existing = loadSavedBarrels().filter((b) => b.id !== barrel.id);
-  const updated = [...existing, { ...barrel, isPreset: false }];
-  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+  writeSavedBarrels([...existing, { ...barrel, isPreset: false }]);
 }
 
 export function deleteSavedBarrel(id: string) {
   if (typeof window === "undefined") return;
-  const updated = loadSavedBarrels().filter((b) => b.id !== id);
-  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+  writeSavedBarrels(loadSavedBarrels().filter((b) => b.id !== id));
 }
